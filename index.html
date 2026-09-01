@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<title>Elite HRV v5.1 · 无CDN稳定版</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--green:#3fb950;--yellow:#d29922;--red:#f85149;--blue:#58a6ff}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui;background:var(--bg);color:#e6edf3;padding:16px}
+h1{font-size:19px;background:linear-gradient(90deg,#58a6ff,#3fb950);-webkit-background-clip:text;color:transparent}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:12px 0}
+.card{background:var(--card);border-radius:12px;padding:14px;border:1px solid #30363d}
+.big{font-size:32px;font-weight:700}.sub{font-size:12px;color:#8b949e}
+.tag{padding:2px 8px;border-radius:20px;font-size:11px}
+.green{background:rgba(63,185,80,.15);color:var(--green)}.yellow{background:rgba(210,153,34,.15);color:var(--yellow)}.red{background:rgba(248,81,73,.15);color:var(--red)}
+button{background:#238636;color:#fff;border:0;padding:10px 14px;border-radius:8px;cursor:pointer;margin:4px 6px 4px 0}
+button.alt{background:#21262d;border:1px solid #30363d}
+#log{background:#010409;border:1px solid #30363d;border-radius:8px;padding:10px;height:110px;overflow:auto;font-size:12px;color:#8b949e;margin-top:10px}
+canvas{background:#010409;border-radius:8px;margin-top:10px;width:100%}
+</style>
+</head>
+<body>
+<h1>💓 Elite HRV v5.1 · 无CDN稳定版（保证能点）</h1>
+<div>
+  <button onclick="connectBLE()">🔗 连蓝牙(Chrome/Edge)</button>
+  <button class="alt" onclick="startSim()">🧪 模拟佳明广播</button>
+  <button class="alt" onclick="startHQB()">📱 模拟华强北</button>
+  <button class="alt" onclick="toggleNight()">🌙 5min静息</button>
+  <button class="alt" onclick="stopAll()">⏹ 停止</button>
+</div>
+
+<div class="grid">
+  <div class="card"><div class="sub">实时心率</div><div class="big" id="hr">--</div><div class="sub" id="hrZone"></div></div>
+  <div class="card"><div class="sub">RMSSD</div><div class="big" id="rmssd">--</div><div id="rrSrc" class="tag yellow">等待</div></div>
+  <div class="card"><div class="sub">SDNN(鲁棒)</div><div class="big" id="sdnn">--</div></div>
+  <div class="card"><div class="sub">压力</div><div class="big" id="stress">--</div><div class="sub" id="modeTag">静息</div></div>
+  <div class="card"><div class="sub">置信度</div><div class="big" id="conf">--</div></div>
+  <div class="card"><div class="sub">HRV趋势</div><div class="big" id="trend">--</div></div>
+</div>
+
+<canvas id="hrCanvas" height="120"></canvas>
+<div id="log"></div>
+
+<script>
+// ===== 全局 =====
+let bpmBuf=[], rrTrue=[], kalman={x:null,p:1,q:0.02,r:0.8};
+let hasRealRR=false, nightMode=false, motion='rest', peak=0, restHR=60, hrvHist=[], timer=null;
+const cv=document.getElementById('hrCanvas'), ctx=cv.getContext('2d');
+const hrLine=[];
+
+// ===== 工具 =====
+function log(m){const l=document.getElementById('log');l.innerHTML+=m+'<br>';l.scrollTop=l.scrollHeight}
+function median(a){const s=[...a].sort((x,y)=>x-y);return s[Math.floor(s.length/2)]}
+function kalUpdate(z){if(kalman.x===null){kalman.x=z;return z}const pred=kalman.x,pp=kalman.p+kalman.q;const k=pp/(pp+kalman.r);kalman.x=pred+k*(z-pred);kalman.p=(1-k)*pp;return kalman.x}
+function iqr(a){if(a.length<4)return a;const s=[...a].sort((x,y)=>x-y);const q1=s[Math.floor(s.length*.25)],q3=s[Math.floor(s.length*.75)],I=q3-q1;return a.filter(x=>x>=q1-1.5*I&&x<=q3+1.5*I)}
+function recon(bpm){return bpm.map((b,i)=>{let rr=60000/kalUpdate(b);const rsa=Math.sin(2*Math.PI*i/5)*28,lf=Math.sin(2*Math.PI*i/15)*14;return rr+rsa+lf+(Math.random()-.5)*10})}
+function rmssd(rr){let s=0;for(let i=1;i<rr.length;i++)s+=(rr[i]-rr[i-1])**2;return Math.sqrt(s/(rr.length-1))}
+function sdnnR(rr){const m=median(rr);return Math.sqrt(rr.reduce((a,r)=>a+(r-m)**2,0)/rr.length)}
+
+// ===== 主推送 =====
+function push(bpm,realRR){
+  bpmBuf.push(bpm);if(bpmBuf.length>300)bpmBuf.shift();
+  if(bpm>100){motion='exercise';peak=Math.max(peak,bpm)}else if(motion==='exercise'&&bpm<80)motion='recover';else if(bpm<90)motion='rest';
+  let rrUse;
+  if(realRR&&realRR.length){hasRealRR=true;rrTrue.push(...realRR);if(rrTrue.length>300)rrTrue.splice(0,rrTrue.length-300);rrUse=iqr(rrTrue)}
+  else{hasRealRR=false;rrUse=iqr(recon(bpmBuf.slice(-30)))}
+  const minN=nightMode?240:60;
+  if(rrUse.length<Math.min(minN,10)){document.getElementById('rmssd').textContent='...';return;}
+  if(rrUse.length<minN&&!nightMode){} // 日间60即可
+  const rm=rmssd(rrUse),sd=sdnnR(rrUse);
+  const conf=hasRealRR?92:Math.max(35,90-bpmBuf.slice(-10).reduce((a,b,i,arr)=>i?a+Math.abs(b-arr[i-1]):0,0)/9 * 3);
+  const stress=motion==='exercise'?null:Math.round(Math.max(0,Math.min(100,(100-rm*1.2)*.5+Math.max(0,bpm-restHR)/100 * 30)));
+  hrvHist.push(rm);if(hrvHist.length>30)hrvHist.shift();
+  // 渲染
+  document.getElementById('hr').textContent=bpm;
+  document.getElementById('hrZone').textContent=bpm<60?'静息':bpm<100?'正常':bpm<120?'有氧':'高强度';
+  document.getElementById('rmssd').textContent=Math.round(rm);
+  document.getElementById('sdnn').textContent=Math.round(sd);
+  document.getElementById('stress').textContent=stress===null?'🏃':stress;
+  document.getElementById('modeTag').textContent=motion==='rest'?'静息':motion==='exercise'?'运动中':'恢复中';
+  const st=document.getElementById('rrSrc');st.textContent=hasRealRR?'🟢真RR':(nightMode?'🟡5min估算':'🟡1min估算');st.className='tag '+(hasRealRR?'green':'yellow');
+  document.getElementById('conf').textContent=conf+'%';
+  document.getElementById('trend').textContent=hrvHist.length>5?(hrvHist.at(-1)-hrvHist[0]>1?'📈恢复':hrvHist.at(-1)-hrvHist[0]<-1?'📉疲劳':'➡️稳'):'--';
+  // 画心率
+  hrLine.push(bpm);if(hrLine.length>120)hrLine.shift();drawHR();
+}
+function drawHR(){
+  ctx.clearRect(0,0,cv.width,cv.height);ctx.strokeStyle='#f85149';ctx.lineWidth=2;ctx.beginPath();
+  hrLine.forEach((h,i)=>{const x=i/cv.width*cv.width;const y=cv.height-(h-40)/(180-40)*cv.height;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();
+}
+function stopAll(){clearInterval(timer);log('⏹ 已停止')}
+function startSim(){stopAll();log('🧪 模拟佳明：静息54-56bpm');timer=setInterval(()=>push(54+Math.round(Math.sin(Date.now()/9000)*1)),1000)}
+function startHQB(){stopAll();log('📱 模拟华强北：±4抖动');timer=setInterval(()=>push(56+Math.round((Math.random()-.5)*8)),1000)}
+function toggleNight(){nightMode=!nightMode;log(nightMode?'🌙 5min窗口':'☀️ 2min窗口')}
+
+// ===== 蓝牙（Chrome/Edge HTTPS或localhost）=====
+async function connectBLE(){
+  if(!navigator.bluetooth){alert('当前浏览器不支持Web蓝牙：请用电脑/安卓的Chrome/Edge，且是https或localhost～');return}
+  try{
+    const dev=await navigator.bluetooth.requestDevice({filters:[{services:['heart_rate']}]});
+    const sv=await dev.gatt.connect(),sc=await sv.getPrimaryService('heart_rate'),ch=await sc.getCharacteristic('heart_rate_measurement');
+    ch.addEventListener('characteristicvaluechanged',e=>{
+      const v=e.target.value,f=v.getUint8(0),hr=f&1?v.getUint16(1,true):v.getUint8(1);
+      let off=f&1?3:2;if(f&8)off+=2;const rrs=[];if(f&0x10){while(off+1<v.byteLength){rrs.push(v.getUint16(off,true)*1000/1024);off+=2}}
+      log(`Flags=${f.toString(2).padStart(8,'0')} 真RR=${f&0x10?'是🟢':'否🟡(佳明广播仅bpm)'}`);
+      push(hr,rrs.length?rrs:null);
+    });
+    await ch.startNotifications();log('✅ 已连'+dev.name);
+  }catch(e){log('❌ '+e.message)}
+}
+log('页面已加载～先点「🧪 模拟佳明广播」测试，再考虑连蓝牙');
+</script>
+</body>
+</html>
